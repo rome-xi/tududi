@@ -1,3 +1,4 @@
+const moment = require('moment-timezone');
 const { getWeekdayInTimezone } = require('../../utils/timezone-utils');
 
 const calculateNextDueDate = (task, fromDate, timezone = 'UTC') => {
@@ -32,7 +33,8 @@ const calculateNextDueDate = (task, fromDate, timezone = 'UTC') => {
             return calculateMonthlyRecurrence(
                 startDate,
                 task.recurrence_interval || 1,
-                task.recurrence_month_day
+                task.recurrence_month_day,
+                timezone
             );
 
         case 'monthly_weekday':
@@ -40,13 +42,15 @@ const calculateNextDueDate = (task, fromDate, timezone = 'UTC') => {
                 startDate,
                 task.recurrence_interval || 1,
                 task.recurrence_weekday,
-                task.recurrence_week_of_month
+                task.recurrence_week_of_month,
+                timezone
             );
 
         case 'monthly_last_day':
             return calculateMonthlyLastDayRecurrence(
                 startDate,
-                task.recurrence_interval || 1
+                task.recurrence_interval || 1,
+                timezone
             );
 
         default:
@@ -148,93 +152,102 @@ const calculateWeeklyRecurrence = (
     return nextDate;
 };
 
-const calculateMonthlyRecurrence = (fromDate, interval, dayOfMonth) => {
-    const nextDate = new Date(fromDate);
-    const targetDay = dayOfMonth || fromDate.getUTCDate();
+// Due dates are stored as the end of the user's local day. West of UTC that
+// instant is already the next UTC day, so UTC getters would read the wrong
+// month. Work in the user's timezone and copy the local wall-clock time.
+const zonedFrom = (fromDate, timezone) =>
+    moment.tz(fromDate, timezone || 'UTC');
 
-    const targetMonth = nextDate.getUTCMonth() + interval;
-    const targetYear = nextDate.getUTCFullYear() + Math.floor(targetMonth / 12);
-    const finalMonth = targetMonth % 12;
+// Add months by year/month arithmetic. setUTCMonth overflows day 29-31 of a
+// long month into the month after a short one (Jan 30 + 1 month -> March).
+const addCalendarMonths = (year, monthIndex, interval) => {
+    const totalMonths = monthIndex + interval;
+    return {
+        year: year + Math.floor(totalMonths / 12),
+        month: totalMonths % 12,
+    };
+};
 
-    const maxDay = new Date(
-        Date.UTC(targetYear, finalMonth + 1, 0)
-    ).getUTCDate();
-    const finalDay = Math.min(targetDay, maxDay);
+const daysInMonth = (year, monthIndex, timezone) =>
+    moment.tz({ year, month: monthIndex, date: 1 }, timezone).daysInMonth();
 
-    const result = new Date(
-        Date.UTC(
-            targetYear,
-            finalMonth,
-            finalDay,
-            fromDate.getUTCHours(),
-            fromDate.getUTCMinutes(),
-            fromDate.getUTCSeconds(),
-            fromDate.getUTCMilliseconds()
+const zonedDateFromTemplate = (year, monthIndex, day, template) => {
+    const month = String(monthIndex + 1).padStart(2, '0');
+    const dayOfMonth = String(day).padStart(2, '0');
+    const zone = template.tz() || 'UTC';
+    return moment
+        .tz(
+            `${year}-${month}-${dayOfMonth} ${template.format('HH:mm:ss.SSS')}`,
+            'YYYY-MM-DD HH:mm:ss.SSS',
+            true,
+            zone
         )
-    );
+        .toDate();
+};
 
-    return result;
+const calculateMonthlyRecurrence = (
+    fromDate,
+    interval,
+    dayOfMonth,
+    timezone = 'UTC'
+) => {
+    const from = zonedFrom(fromDate, timezone);
+    const targetDay = dayOfMonth || from.date();
+    const { year, month } = addCalendarMonths(
+        from.year(),
+        from.month(),
+        interval
+    );
+    const finalDay = Math.min(targetDay, daysInMonth(year, month, timezone));
+
+    return zonedDateFromTemplate(year, month, finalDay, from);
 };
 
 const calculateMonthlyWeekdayRecurrence = (
     fromDate,
     interval,
     weekday,
-    weekOfMonth
+    weekOfMonth,
+    timezone = 'UTC'
 ) => {
-    const nextDate = new Date(fromDate);
-    nextDate.setUTCMonth(nextDate.getUTCMonth() + interval);
-
-    const firstOfMonth = new Date(
-        Date.UTC(nextDate.getUTCFullYear(), nextDate.getUTCMonth(), 1)
+    const from = zonedFrom(fromDate, timezone);
+    const { year, month } = addCalendarMonths(
+        from.year(),
+        from.month(),
+        interval
     );
-    const firstWeekday = firstOfMonth.getUTCDay();
 
-    const daysToAdd = (weekday - firstWeekday + 7) % 7;
-    const firstOccurrence = new Date(firstOfMonth);
-    firstOccurrence.setUTCDate(1 + daysToAdd);
+    const firstOfMonth = moment.tz({ year, month, date: 1 }, timezone);
+    const daysToAdd = (weekday - firstOfMonth.day() + 7) % 7;
+    let day = 1 + daysToAdd + (weekOfMonth - 1) * 7;
 
-    const targetDate = new Date(firstOccurrence);
-    targetDate.setUTCDate(firstOccurrence.getUTCDate() + (weekOfMonth - 1) * 7);
-
-    if (targetDate.getUTCMonth() !== nextDate.getUTCMonth()) {
-        targetDate.setUTCDate(targetDate.getUTCDate() - 7);
+    // A 5th weekday does not exist in every month. Step back one week,
+    // which is the last occurrence of that weekday.
+    if (day > firstOfMonth.daysInMonth()) {
+        day -= 7;
     }
 
-    targetDate.setUTCHours(
-        fromDate.getUTCHours(),
-        fromDate.getUTCMinutes(),
-        fromDate.getUTCSeconds(),
-        fromDate.getUTCMilliseconds()
-    );
-
-    return targetDate;
+    return zonedDateFromTemplate(year, month, day, from);
 };
 
-const calculateMonthlyLastDayRecurrence = (fromDate, interval) => {
-    // Calculate target year and month directly to avoid date overflow
-    // (e.g., Jan 31 + 1 month via setUTCMonth would overflow to March)
-    const currentMonth = fromDate.getUTCMonth();
-    const currentYear = fromDate.getUTCFullYear();
-
-    const totalMonths = currentMonth + interval;
-    const targetYear = currentYear + Math.floor(totalMonths / 12);
-    const targetMonth = totalMonths % 12;
-
-    // Get last day of target month by creating date at day 0 of following month
-    const lastDayOfMonth = new Date(
-        Date.UTC(
-            targetYear,
-            targetMonth + 1, // next month
-            0, // day 0 = last day of previous month
-            fromDate.getUTCHours(),
-            fromDate.getUTCMinutes(),
-            fromDate.getUTCSeconds(),
-            fromDate.getUTCMilliseconds()
-        )
+const calculateMonthlyLastDayRecurrence = (
+    fromDate,
+    interval,
+    timezone = 'UTC'
+) => {
+    const from = zonedFrom(fromDate, timezone);
+    const { year, month } = addCalendarMonths(
+        from.year(),
+        from.month(),
+        interval
     );
 
-    return lastDayOfMonth;
+    return zonedDateFromTemplate(
+        year,
+        month,
+        daysInMonth(year, month, timezone),
+        from
+    );
 };
 
 const getFirstWeekdayOfMonth = (year, month, weekday) => {
